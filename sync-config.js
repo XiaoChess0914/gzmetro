@@ -1,9 +1,6 @@
-/* 共享校正配置
-   1. 部署 gzmetro_sync 的 Cloudflare Worker
-   2. 把 Worker 地址填到 url（不要带结尾斜杠）
-   3. 重新上传本文件到 GitHub Pages
-   留空则只使用本机 localStorage，不同步。 */
+/* 共享校正配置：Cloudflare Pages Functions，同域 /api。
+   部署 Pages 后把域名换成你的项目地址；留空则完全走本机校正。 */
 window.GZ_SYNC = {
-  url: 'https://gzmetro-sync.1711903835.workers.dev',
+  url: 'https://gzmetro-live-0914.pages.dev/api',
   pollMs: 30000,
 };
