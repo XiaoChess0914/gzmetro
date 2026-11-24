@@ -187,11 +187,12 @@ function nextArrivalsAt(dir, stationIdx, nowMin, limit = 3, opts = {}) {
     if (d.express && !d.stopSet.has(st.name)) continue;
     const j = d.order.indexOf(stationIdx);
     if (j < 0) continue;
-    const dw = stationDwell(d, j);
     const anchor = base ? -Infinity : dirAnchor(d, stationIdx);
     let n = 0;
     for (const dep of depsFor(d, base ? { base: true } : {})) {
-      const at = dep + (d.offsets[j] || 0) - dw;
+      const dw = dwellWith(d, dep, j, base);
+      const offs = offsetsOf(d, dep, base);
+      const at = dep + (offs[j] || 0) - dw;
       const leave = at + dw;
       if (leave >= nowMin - 0.05 && at >= anchor - 0.05) {
         out.push({ dep, at, leave, d, j, dw });
@@ -500,7 +501,7 @@ function buildExpressDir(line, baseDir, sd) {
   return {
     to: names[names.length - 1], order, offsets, total: offsets[offsets.length - 1],
     first: Math.min(...deps.weekday), last: Math.max(...deps.weekday),
-    hw: baseDir.hw, express: true, baseTo: baseDir.to,
+    hw: baseDir.hw, express: true, baseTo: baseDir.to, baseDir,
     depsExplicit: deps, stopSet: new Set(sd.stops), stopNames: sd.stops.slice(),
   };
 }
@@ -555,6 +556,97 @@ function dwellFor(dir, i) {
 function originDwellFor(dir) { return dir ? ORIGIN_DWELL_MIN : 0; }
 function stationDwell(dir, j) { return j > 0 ? dwellFor(dir, j) : originDwellFor(dir); }
 
+/* 快车与慢车同站同时停靠的修正（方案 B）：慢车占着站台时，快车这一站直接通过；
+   起点站另作处理——慢车在起点停 1 分钟期间快车不该也停在同一个站台，于是把该班快车
+   整体顺延到慢车出站之后再发车。快车不排队等慢车，所以不会级联拖慢整条线。按天缓存。 */
+const PLATFORM_MARGIN = 0.05;
+const ORIGIN_STAGGER = 0.3;   // 起点让位：慢车出站后至少再隔这么久快车才发车
+
+function dwellBase(dir, i) {
+  if (!dir || i < 0 || i >= dir.offsets.length) return 0;
+  if (i === 0) return originDwellFor(dir);
+  const gap = dir.offsets[i] - dir.offsets[i - 1];
+  if (!(gap > 0.02)) return 0;
+  return Math.min(0.42, gap * 0.35);
+}
+
+function offsKey(dir, dep, isBase) {
+  return Math.round((isBase ? dep : dep - dirShift(dir)) * 1000) / 1000;
+}
+
+function ensureExp(dir) {
+  const owner = dir && dir.baseDir ? dir.baseDir : dir;
+  if (!owner || !owner.expDirs || !owner.expDirs.length) return;
+  if (owner._ndDay === state.day) return;
+  owner._ndDay = state.day;
+  const wins = new Map();
+  for (const dep of depsFor(owner, { base: true })) {
+    for (let j = 0; j < owner.offsets.length; j++) {
+      const dw = dwellBase(owner, j);
+      let list = wins.get(owner.order[j]);
+      if (!list) { list = []; wins.set(owner.order[j], list); }
+      list.push([dep + owner.offsets[j] - dw, dep + owner.offsets[j]]);
+    }
+  }
+  for (const ed of owner.expDirs) {
+    const offsMap = new Map(), skipMap = new Map();
+    for (const dep of depsFor(ed, { base: true })) {
+      const offs = ed.offsets.slice();
+      const skip = new Set();
+      let delta = 0, originClash = false;
+      for (const [aL, dL] of wins.get(ed.order[0]) || []) {
+        const arr0 = dep + offs[0] - dwellBase(ed, 0), dep0 = dep + offs[0];
+        if (arr0 < dL + PLATFORM_MARGIN && dep0 > aL - PLATFORM_MARGIN) {
+          originClash = true;
+          if (dep < dL + PLATFORM_MARGIN) delta = Math.max(delta, dL + ORIGIN_STAGGER - dep);
+        }
+      }
+      if (originClash) {
+        if (delta > 0) for (let k = 0; k < offs.length; k++) offs[k] += delta;
+        skip.add(0); // 起点不再提前停靠：慢车走了快车才出现，到点直接发车
+      }
+      for (let j = 1; j < offs.length; j++) {
+        const dw = dwellBase(ed, j);
+        if (!(dw > 0)) continue;
+        const st = state.line.stations[ed.order[j]];
+        if (!st || !ed.stopSet.has(st.name)) continue;
+        const arr = dep + offs[j] - dw, depT = dep + offs[j];
+        for (const [aL, dL] of wins.get(ed.order[j]) || []) {
+          if (arr < dL + PLATFORM_MARGIN && depT > aL - PLATFORM_MARGIN) { skip.add(j); break; }
+        }
+      }
+      const key = Math.round(dep * 1000) / 1000;
+      offsMap.set(key, offs);
+      skipMap.set(key, skip);
+    }
+    ed._offs = offsMap;
+    ed._noDwell = skipMap;
+  }
+}
+
+/* 该班车的运行时分偏移（快车可能因起点让位整体顺延） */
+function offsetsOf(dir, dep, isBase) {
+  if (!dir) return [];
+  if (!dir.express) return dir.offsets;
+  ensureExp(dir);
+  const map = dir._offs;
+  return (map && map.get(offsKey(dir, dep, isBase))) || dir.offsets;
+}
+
+/* 停站时长：慢车看区间间隔；快车在跳停站为 0，慢车占着站台时也不停 */
+function dwellWith(dir, dep, i, isBase) {
+  const base = dwellBase(dir, i);
+  if (!(base > 0) || !dir.express || !state.line) return base;
+  if (i > 0) {
+    const st = state.line.stations[dir.order[i]];
+    if (st && !dir.stopSet.has(st.name)) return 0;
+  }
+  ensureExp(dir);
+  const set = dir._noDwell && dir._noDwell.get(offsKey(dir, dep, isBase));
+  if (set && set.has(i)) return 0;
+  return base;
+}
+
 function routeKmOf(line) {
   if (line._routeKm) return line._routeKm;
   const geom = prepGeometry(line);
@@ -589,17 +681,17 @@ function speedCurve(u, avgKmh) {
   return { f: 1 - 0.5 * peak * t * w * w, v: peak * w, peak };
 }
 
-function trainPos(line, dir, minutes) {
+function trainPos(line, dir, minutes, dep) {
   if (minutes < 0) {
     const A = line.stations[dir.order[0]];
     const B = line.stations[dir.order[1]] || A;
     return { s: A.s, i: 0, f: 0, u: 0, A, B, dwelling: true, dwellLeft: -minutes, pre: true, speedKmh: 0, distKm: 0 };
   }
-  const off = dir.offsets;
-  const p = clamp(minutes, 0, dir.total);
+  const off = offsetsOf(dir, dep);
+  const p = clamp(minutes, off[0] || 0, off[off.length - 1] || dir.total);
   let i = 0;
   while (i < off.length - 2 && p >= off[i + 1]) i++;
-  const dwell = dwellFor(dir, i + 1);
+  const dwell = dwellWith(dir, dep, i + 1);
   const arrive = off[i + 1] - dwell;
   const moveSpan = Math.max(0.01, arrive - off[i]);
   const u = clamp((p - off[i]) / moveSpan, 0, 1);
@@ -878,7 +970,9 @@ function activeTrains(line, dir, nowMin) {
   for (const dep of deps) {
     if (dep < cutoff - 0.05) continue;
     const t = nowMin - dep;
-    if (t >= -ORIGIN_DWELL_MIN && t <= dir.total) out.push({ dep, t, pre: t < 0 });
+    const pre = dwellWith(dir, dep, 0);
+    const offs = offsetsOf(dir, dep);
+    if (t >= -pre + (offs[0] || 0) && t <= (offs[offs.length - 1] || dir.total)) out.push({ dep, t, pre: t < 0 });
   }
   return out;
 }
@@ -897,7 +991,7 @@ function updateTrains(now) {
   }
   for (const dir of variants) {
     for (const { dep, t } of activeTrains(line, dir, nowMin)) {
-      const pos = trainPos(line, dir, t);
+      const pos = trainPos(line, dir, t, dep);
       const p = state.geom.ptAtS(pos.s);
       const [x, y] = state.proj(p[0], p[1]);
       const g = svgEl('g', { class: 'trainDot' + (dir.express ? ' express' : '') + (pos.dwelling ? ' dwelling' : ''), style: 'cursor:pointer' });
@@ -928,17 +1022,19 @@ function updateTrains(now) {
           if (dir.stopSet.has(n)) { nextName = n; break; }
         }
       }
-      const atTerminal = !pos.pre && pos.i + 1 >= dir.offsets.length - 1;
-      const dwellSec = pos.pre ? Math.max(0, Math.round(-t * 60)) : Math.max(0, Math.round((dir.offsets[pos.i + 1] - t) * 60));
+      const offsT = offsetsOf(dir, dep);
+      const atTerminal = !pos.pre && pos.i + 1 >= offsT.length - 1;
+      const dwellSec = pos.pre ? Math.max(0, Math.round(-t * 60)) : Math.max(0, Math.round((offsT[pos.i + 1] - t) * 60));
       const dwellTxt = pos.pre ? '起点站停站中 · 约 ' + dwellSec + ' 秒后发车' : (atTerminal ? '终到站停站中' : '停站中 · 约 ' + dwellSec + ' 秒后发车');
       const speedTxt = (!pos.pre && !pos.dwelling && Number.isFinite(pos.speedKmh)) ? ' · 约 ' + Math.round(pos.speedKmh) + ' km/h' : '';
+      const depShow = dep + (offsT[0] || 0);
       const title = svgEl('title');
-      title.textContent = (dir.express ? '快车 · ' : '') + '往 ' + dir.to + ' · ' + fmtHM(dep) + ' 发车' + (pos.dwelling ? ' · ' + dwellTxt : speedTxt);
+      title.textContent = (dir.express ? '快车 · ' : '') + '往 ' + dir.to + ' · ' + fmtHM(depShow) + ' 发车' + (pos.dwelling ? ' · ' + dwellTxt : speedTxt);
       g.appendChild(title);
       g.addEventListener('click', (e) => {
         e.stopPropagation();
         $('#trainTip').hidden = false;
-        $('#trainTip').innerHTML = '<b>' + (dir.express ? '快车 · ' : '') + '往 ' + dir.to + '</b>' + fmtHM(dep) + ' 发车 · ' + (pos.pre ? '起点站待发' : '已运行 ' + Math.floor(t) + ' 分' + speedTxt) + '<br>' + (pos.dwelling ? dwellTxt : '下一站 ' + nextName);
+        $('#trainTip').innerHTML = '<b>' + (dir.express ? '快车 · ' : '') + '往 ' + dir.to + '</b>' + fmtHM(depShow) + ' 发车 · ' + (pos.pre ? '起点站待发' : '已运行 ' + Math.floor(t) + ' 分' + speedTxt) + '<br>' + (pos.dwelling ? dwellTxt : '下一站 ' + nextName);
       });
       layer.appendChild(g);
       state.trains.push({ dir, dep, t, express: !!dir.express, angle, x, y, dwelling: pos.dwelling, dwellSec, pre: !!pos.pre, speedKmh: pos.speedKmh });
@@ -1019,10 +1115,11 @@ function renderPanel(force) {
         const j = d.order.indexOf(state.station);
         if (j < 0) continue;
         let n = 0;
-        const dw = stationDwell(d, j);
         const anchor = dirAnchor(d, state.station);
         for (const dep of depsFor(d)) {
-          const at = dep + (d.offsets[j] || 0) - dw;
+          const dw = dwellWith(d, dep, j);
+          const offs = offsetsOf(d, dep);
+          const at = dep + (offs[j] || 0) - dw;
           const leave = at + dw;
           if (leave >= nowMin - 0.05 && at >= anchor - 0.05) {
             (d.express ? exps : locals).push({ dep, at, leave, d });
@@ -1048,7 +1145,7 @@ function renderPanel(force) {
           const mm = Math.floor(totalSec / 60), ss = totalSec % 60;
           const here = nowMin >= x.at - 0.05 && nowMin <= x.leave + 0.05;
           const soon = diff < 0.7;
-          const pos = trainPos(line, x.d, nowMin - x.dep);
+          const pos = trainPos(line, x.d, nowMin - x.dep, x.dep);
           const stops = (pos.dwelling && pos.B === st) ? 0 : stopsAhead(line, x.d, state.station, pos);
           const stopTxt = stops > 0 ? '还有 ' + stops + ' 站 · ' : '';
           const right = (k === 0 ? stopTxt : '') + fmtHM(x.at) + ' 到站';
@@ -1201,7 +1298,7 @@ async function main() {
     state.data.lines.find((l) => l.code === '1') || state.data.lines[0];
   selectLine(line, wantSt);
   state.day = dayTypeOf(nowSim());
-  globalThis.__gz = { state, selectLine, selectStation, renderMap, renderPanel, nowSim, tick, trainPos, dwellFor, depsFor, activeTrains, stationDwell, originDwellFor, dirShift, dirAnchor, remoteFor, refreshRemote, nextArrivalsAt, applyCalibration, clearCalibration, renderCalib, todayKeyShanghai };
+  globalThis.__gz = { state, selectLine, selectStation, renderMap, renderPanel, nowSim, tick, trainPos, dwellFor, depsFor, activeTrains, stationDwell, originDwellFor, dirShift, dirAnchor, remoteFor, refreshRemote, nextArrivalsAt, applyCalibration, clearCalibration, renderCalib, todayKeyShanghai, dwellWith, ensureExp, offsetsOf, dwellBase };
   tick(true);
   setInterval(() => tick(false), 250);
   if (syncEnabled()) {
