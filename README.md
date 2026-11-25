@@ -2,6 +2,11 @@
 
 把几个开源广州地铁项目合并成的一个单页工具：在线路示意图上按运行图推演列车位置，并算每个站下一班还有多久。
 
+线上地址：
+
+- Cloudflare Pages（含共享校正）：https://gzmetro-live-0914.pages.dev/
+- GitHub Pages（纯静态）：https://XiaoChess0914.github.io/gzmetro/
+
 > 不是实时车辆定位。广州地铁没有公开的车辆位置 / GTFS-RT 接口，官方“列车到站查询”只在微信小程序里试点过计划到站，接口也已封禁。这里只能按公开首末班、发车间隔和区间运行时分推演。
 
 ## 运行
@@ -42,12 +47,35 @@ node server.mjs
 
 ### 共享模式
 
-在 `sync-config.js` 里填上 Cloudflare Worker 地址后，点“重算”会把“线路 / 方向 / 站号 / 无校准的预计分钟 / 实际分钟”提交到后端；后端取最近 45 分钟内同一线路、同一方向的校正中位数，作为所有访客共用的平移量。页面每 30 秒刷新一次共享校正，页面隐藏时暂停。
+在 `sync-config.js` 里填上 Cloudflare Pages 的 `/api` 地址后，点“重算”会把“线路 / 方向 / 站号 / 无校准的预计分钟 / 实际分钟”提交到后端；后端取最近 45 分钟内同一线路、同一方向的校正中位数，作为所有访客共用的平移量。页面每 30 秒刷新一次共享校正，页面隐藏时暂停。
 
 共享校正成功时，本机对同方向的校正会被清掉，避免两套偏移叠加；共享服务连不上时，如果已有共享记录就继续用共享记录，没有就退回本机校正。清除按钮只清本机记录，不会删除别人已经提交的数据。
 
-后端部署见 `/storage/emulated/0/gzmetro_sync/README.md`。它只保存校正所需的字段，IP 只存哈希；同一 IP 一分钟最多 3 条。  
+后端是 Cloudflare Pages Functions（`_worker.js`）+ D1，和前端在同一个 `pages.dev` 域名下，走 `/api/*`。它只保存校正所需的字段，IP 只存哈希；同一 IP 一分钟最多 3 条。  
 校正不能还原区间里的逐段晚点，也不能代替实时车辆位置。
+
+## 部署
+
+### GitHub Pages（纯静态）
+
+把仓库根目录的这些文件放好：
+
+`index.html`、`style.css`、`app.js`、`data.json`、`express.json`、`logo-full.png`、`sync-config.js`、`sync.js`、`_worker.js`
+
+其中 `_worker.js` 只在 Cloudflare Pages 下生效，GitHub Pages 会把它当普通文件忽略。
+
+Settings → Pages → Deploy from a branch → `main` / `(root)` → Save。等 1–2 分钟，访问 `https://<用户名>.github.io/<仓库名>/`。
+
+### Cloudflare Pages + D1（共享校正）
+
+1. 在 Cloudflare 建 D1 数据库，名 `gzmetro-sync`，在控制台执行 `schema.sql`。
+2. 用 Git 集成创建 Pages 项目，仓库指向本仓库；构建命令 `exit 0`，构建输出目录 `/`，根目录 `/`。
+3. 在 Pages 项目 **设置 → 绑定** 添加 D1 数据库：变量名 `DB`，数据库 `gzmetro-sync`。
+4. 在 **设置 → 变量和密钥** 添加密钥 `IP_SALT`，值用一段随机字符串。
+5. 重新部署一次，让绑定生效；访问 `https://<项目>.pages.dev/api/health` 应返回 `{"ok":true,...}`。
+6. 把 `sync-config.js` 里的 `url` 改成 `https://<项目>.pages.dev/api`，提交并等 Pages 重新部署。
+
+不要用 `workers.dev` 作为共享后端：国内网络下该域名可能被污染，请求会超时。Pages Functions 和前端同域，走 `/api` 更稳。
 
 ## 数据与来源
 
