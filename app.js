@@ -8,6 +8,7 @@ const $ = (s) => document.querySelector(s);
 const rad = (d) => d * Math.PI / 180;
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const ORIGIN_DWELL_MIN = 1.6;
+const LINE_MAX_KMH = { '十八号线': 160, '二十二号线': 160 };
 const CALIB_KEY = 'gzmetro.calib.v1';
 const SYNC = (typeof window !== 'undefined' && window.GZSync) || null;
 function syncEnabled() { return !!(SYNC && SYNC.enabled); }
@@ -102,11 +103,14 @@ function headwayAt(segs, t) {
   for (const [st, v] of segs) { if (t + 1e-6 >= st) h = v; else break; }
   return Math.max(1.2, h);
 }
+function dirKey(dir) {
+  return (dir.baseTo || dir.to) + (dir.express ? '|E' : '');
+}
 function dirCalib(dir) {
   if (!dir || !state.line || !state.calib || state.calib.date !== todayKey(nowSim())) return null;
   const rec = state.calib.lines && state.calib.lines[String(state.line.id)];
   if (!rec || !rec.dirs) return null;
-  const it = rec.dirs[dir.baseTo || dir.to];
+  const it = rec.dirs[dirKey(dir)];
   return it || null;
 }
 function ensureRemote() {
@@ -121,7 +125,7 @@ function ensureRemote() {
 function remoteFor(dir) {
   if (!dir || !state.line || !state.remote) return null;
   if (state.remote.date !== todayKeyShanghai() || state.remote.lineId !== String(state.line.id)) return null;
-  const it = state.remote.dirs && state.remote.dirs[dir.baseTo || dir.to];
+  const it = state.remote.dirs && state.remote.dirs[dirKey(dir)];
   return it && Number(it.count) > 0 && Number.isFinite(Number(it.shift)) ? it : null;
 }
 function dirShift(dir) {
@@ -182,7 +186,12 @@ function nextArrivalsAt(dir, stationIdx, nowMin, limit = 3, opts = {}) {
   if (!st) return [];
   const base = !!(opts && opts.base);
   const out = [];
-  const variants = [dir].concat(dir.expDirs || []);
+  const only = opts && opts.only;
+  const variants = [dir].concat(dir.expDirs || []).filter((d) => {
+    if (only === 'express') return !!d.express;
+    if (only === 'local') return !d.express;
+    return true;
+  });
   for (const d of variants) {
     if (d.express && !d.stopSet.has(st.name)) continue;
     const j = d.order.indexOf(stationIdx);
@@ -204,16 +213,19 @@ function nextArrivalsAt(dir, stationIdx, nowMin, limit = 3, opts = {}) {
   return out.slice(0, limit);
 }
 
-function calibrationInput(dirIndex, actualMin, stationIdx) {
+function calibrationInput(dirIndex, actualMin, stationIdx, isExpress) {
   const line = state.line;
   if (!line) return { ok: false, error: '没有选中线路' };
   const dir = line.dirs[Number(dirIndex)];
   if (!dir) return { ok: false, error: '方向无效' };
   const st = line.stations[stationIdx];
   if (!st) return { ok: false, error: '站点无效' };
+  const targetDir = isExpress ? (dir.expDirs || [])[0] : dir;
+  if (isExpress && !targetDir) return { ok: false, error: '本方向没有快车' };
+  if (isExpress && !targetDir.stopSet.has(st.name)) return { ok: false, error: '快车不停本站，不能按快车校正' };
   const actual = Math.round(Number(actualMin) * 10) / 10;
   if (!Number.isFinite(actual) || actual < 0 || actual > 30) return { ok: false, error: '请输入 0–30 分钟' };
-  return { ok: true, line, dir, st, actual, stationIdx: Number(stationIdx), nowMin: simMinutes(nowSim()) };
+  return { ok: true, line, dir, targetDir, isExpress: !!isExpress, st, actual, stationIdx: Number(stationIdx), nowMin: simMinutes(nowSim()) };
 }
 
 function refreshAfterCalib() {
@@ -229,45 +241,46 @@ function clearLocalDir(dir, line) {
   const lid = String(line.id);
   const rec = state.calib.lines[lid];
   if (!rec || !rec.dirs) return;
-  delete rec.dirs[dir.to];
-  if (dir.baseTo) delete rec.dirs[dir.baseTo];
+  delete rec.dirs[dirKey(dir)];
   if (!Object.keys(rec.dirs).length) delete state.calib.lines[lid];
   if (!Object.keys(state.calib.lines).length) { state.calib = null; dropCalibStorage(); }
   else saveCalib();
 }
 
 function commitLocalCalibration(p) {
-  const next = nextArrivalsAt(p.dir, p.stationIdx, p.nowMin, 1)[0];
-  if (!next) return { ok: false, error: '该方向暂无可校正的后续列车' };
+  const only = p.isExpress ? 'express' : 'local';
+  const next = nextArrivalsAt(p.targetDir, p.stationIdx, p.nowMin, 1, { only })[0];
+  if (!next) return { ok: false, error: p.isExpress ? '该方向暂无可校正的后续快车' : '该方向暂无可校正的后续列车' };
   const modelEta = Math.max(0, Math.round((next.at - p.nowMin) * 10) / 10);
-  const oldShift = dirShift(p.dir);
+  const oldShift = dirShift(p.targetDir);
   let shift = Math.round((oldShift + p.actual - modelEta) * 10) / 10;
   shift = clamp(shift, -30, 30);
   if (Math.abs(shift) < 0.05) shift = 0;
   const rec = calibRecord();
   const anchor = Math.round((p.nowMin + p.actual) * 10) / 10;
-  rec.dirs[p.dir.to] = { shift, anchor, stationIdx: p.stationIdx, station: p.st.name, at: Date.now(), actual: p.actual, model: modelEta };
+  rec.dirs[dirKey(p.targetDir)] = { shift, anchor, stationIdx: p.stationIdx, station: p.st.name, at: Date.now(), actual: p.actual, model: modelEta, express: !!p.isExpress };
   rec.updated = Date.now();
   saveCalib();
   refreshAfterCalib();
-  return { ok: true, shared: false, shift, modelEta, actual: p.actual, dir: p.dir.to, station: p.st.name };
+  return { ok: true, shared: false, shift, modelEta, actual: p.actual, dir: p.targetDir.to, station: p.st.name, express: !!p.isExpress };
 }
 
 async function submitSharedCalibration(p) {
-  const next = nextArrivalsAt(p.dir, p.stationIdx, p.nowMin, 1, { base: true })[0];
-  if (!next) return { ok: false, error: '该方向暂无可校正的后续列车' };
+  const only = p.isExpress ? 'express' : 'local';
+  const next = nextArrivalsAt(p.targetDir, p.stationIdx, p.nowMin, 1, { base: true, only })[0];
+  if (!next) return { ok: false, error: p.isExpress ? '该方向暂无可校正的后续快车' : '该方向暂无可校正的后续列车' };
   const baseEta = Math.max(0, Math.round((next.at - p.nowMin) * 10) / 10);
+  const key = dirKey(p.targetDir);
   try {
     const r = await SYNC.post({
       lineId: String(p.line.id),
-      dirTo: p.dir.baseTo || p.dir.to,
+      dirTo: key,
       stationName: p.st.name,
       serviceDate: todayKeyShanghai(),
       stationIdx: p.stationIdx,
       baseEta: Math.min(180, baseEta),
       actualMin: p.actual,
     });
-    const key = p.dir.baseTo || p.dir.to;
     const count = Number(r && r.count) || 0;
     const shift = Number(r && r.shift);
     if (!(count > 0) || !Number.isFinite(shift)) throw new Error('共享服务没有返回有效校正');
@@ -281,16 +294,16 @@ async function submitSharedCalibration(p) {
       windowMin: Number(r.windowMin) || 45,
     };
     state.remoteError = '';
-    clearLocalDir(p.dir, p.line);
+    clearLocalDir(p.targetDir, p.line);
     refreshAfterCalib();
     return {
       ok: true, shared: true, shift: remote.dirs[key].shift, count: remote.dirs[key].count,
-      actual: p.actual, dir: p.dir.to, station: p.st.name,
+      actual: p.actual, dir: p.targetDir.to, station: p.st.name, express: !!p.isExpress,
     };
   } catch (e) {
     const msg = (e && e.message) ? e.message : '共享服务异常';
     state.remoteError = msg;
-    if (remoteFor(p.dir)) {
+    if (remoteFor(p.targetDir)) {
       renderCalib();
       return { ok: false, error: '共享提交失败：' + msg + '（当前仍用已有共享校正）' };
     }
@@ -301,8 +314,8 @@ async function submitSharedCalibration(p) {
   }
 }
 
-function applyCalibration(dirIndex, actualMin, stationIdx = state.station) {
-  const p = calibrationInput(dirIndex, actualMin, stationIdx);
+function applyCalibration(dirIndex, actualMin, stationIdx = state.station, isExpress = false) {
+  const p = calibrationInput(dirIndex, actualMin, stationIdx, isExpress);
   if (!p.ok) return p;
   if (syncEnabled()) return submitSharedCalibration(p);
   return commitLocalCalibration(p);
@@ -331,8 +344,10 @@ async function refreshRemote() {
   const date = todayKeyShanghai();
   const keys = [];
   for (const d of line.dirs) {
-    const k = d.baseTo || d.to;
-    if (!keys.includes(k)) keys.push(k);
+    for (const v of [d].concat(d.expDirs || [])) {
+      const k = dirKey(v);
+      if (!keys.includes(k)) keys.push(k);
+    }
   }
   const prev = (state.remote && state.remote.date === date && state.remote.lineId === String(line.id))
     ? state.remote : { date, lineId: String(line.id), dirs: {} };
@@ -380,13 +395,20 @@ function renderCalib() {
   sel.innerHTML = line.dirs.map((d, i) => '<option value="' + i + '">往 ' + d.to + '</option>').join('');
   if (prev !== '' && Number(prev) < line.dirs.length) sel.value = prev;
 
+  const variants = [];
+  for (const d of line.dirs) {
+    variants.push(d);
+    for (const e of d.expDirs || []) variants.push(e);
+  }
+  const label = (d) => '往' + d.to + (d.express ? ' 快' : '');
+
   const localParts = [];
   if (state.calib && state.calib.date === todayKey(nowSim())) {
     const rec = state.calib.lines && state.calib.lines[String(line.id)];
     if (rec && rec.dirs) {
-      for (const d of line.dirs) {
-        const it = rec.dirs[d.to];
-        if (it) localParts.push('往' + d.to + ' ' + (it.shift >= 0 ? '+' : '') + it.shift.toFixed(1) + ' 分');
+      for (const d of variants) {
+        const it = rec.dirs[dirKey(d)];
+        if (it) localParts.push(label(d) + ' ' + (it.shift >= 0 ? '+' : '') + Number(it.shift).toFixed(1) + ' 分');
       }
     }
   }
@@ -396,14 +418,10 @@ function renderCalib() {
     const rr = (state.remote && state.remote.date === todayKeyShanghai() && state.remote.lineId === String(line.id))
       ? state.remote : null;
     if (rr && rr.dirs) {
-      const seen = new Set();
-      for (const d of line.dirs) {
-        const k = d.baseTo || d.to;
-        if (seen.has(k)) continue;
-        seen.add(k);
-        const it = rr.dirs[k];
+      for (const d of variants) {
+        const it = rr.dirs[dirKey(d)];
         if (it && Number(it.count) > 0) {
-          remoteParts.push('往' + d.to + ' ' + (it.shift >= 0 ? '+' : '') + Number(it.shift).toFixed(1) + ' 分（' + it.count + ' 条）');
+          remoteParts.push(label(d) + ' ' + (Number(it.shift) >= 0 ? '+' : '') + Number(it.shift).toFixed(1) + ' 分（' + it.count + ' 条）');
         }
       }
     }
@@ -415,6 +433,13 @@ function renderCalib() {
     badge.hidden = !shown.length;
     badge.textContent = remoteParts.length ? '共享校正' : (localParts.length ? '今日已校正' : '');
   }
+  const expWrap = $('#calibExpressWrap');
+  if (expWrap) {
+    const st = line.stations[state.station];
+    const hasExpress = !!st && variants.some((d) => d.express && d.stopSet.has(st.name));
+    expWrap.hidden = !hasExpress;
+    if (!hasExpress) { const box = $('#calibExpress'); if (box) box.checked = false; }
+  }
   const note = $('#calibNote');
   if (note) {
     if (remoteParts.length) {
@@ -425,7 +450,7 @@ function renderCalib() {
     } else if (syncEnabled() && state.remoteError) {
       note.textContent = '共享服务连接失败：' + state.remoteError + '；可先用本机校正';
     } else {
-      note.textContent = '看站台屏：选方向，填下一班还有几分钟；0 = 已到站';
+      note.textContent = '看站台屏：选方向，填下一班还有几分钟；快车先勾“快车”；0 = 已到站';
     }
   }
   const mini = document.querySelector('.calibMini');
@@ -441,7 +466,8 @@ async function calibrationFromUI() {
   if (!raw) { const note = $('#calibNote'); if (note) note.textContent = '先填站台屏上的分钟数'; return; }
   let r;
   try {
-    r = await applyCalibration(Number($('#calibDir').value), Number(raw), state.station);
+    const isExpress = !!($('#calibExpress') && $('#calibExpress').checked);
+    r = await applyCalibration(Number($('#calibDir').value), Number(raw), state.station, isExpress);
   } catch (e) {
     const note = $('#calibNote');
     if (note) note.textContent = '校正失败：' + ((e && e.message) || e);
@@ -456,8 +482,8 @@ async function calibrationFromUI() {
   const note = $('#calibNote');
   if (note) {
     const head = r.shared
-      ? '已共享：往 ' + r.dir + ' ' + (r.shift >= 0 ? '+' : '') + r.shift.toFixed(1) + ' 分 · ' + r.count + ' 条中位'
-      : '已重算：往 ' + r.dir + ' ' + (r.shift >= 0 ? '+' : '') + r.shift.toFixed(1) + ' 分 · 仅本机';
+      ? '已共享：往 ' + r.dir + (r.express ? ' 快车' : '') + ' ' + (r.shift >= 0 ? '+' : '') + r.shift.toFixed(1) + ' 分 · ' + r.count + ' 条中位'
+      : '已重算：往 ' + r.dir + (r.express ? ' 快车' : '') + ' ' + (r.shift >= 0 ? '+' : '') + r.shift.toFixed(1) + ' 分 · 仅本机';
     note.textContent = r.warning ? r.warning + ' · ' + head : head;
   }
 }
@@ -804,6 +830,7 @@ function selectLine(line, preferName) {
   renderPanel(true);
   const eta = $('#calibEta'); if (eta) eta.value = '';
   const cdir = $('#calibDir'); if (cdir) cdir.value = '';
+  const cexp = $('#calibExpress'); if (cexp) cexp.checked = false;
   state.remote = null;
   state.remoteError = '';
   renderCalib();
@@ -1026,7 +1053,7 @@ function updateTrains(now) {
       const atTerminal = !pos.pre && pos.i + 1 >= offsT.length - 1;
       const dwellSec = pos.pre ? Math.max(0, Math.round(-t * 60)) : Math.max(0, Math.round((offsT[pos.i + 1] - t) * 60));
       const dwellTxt = pos.pre ? '起点站停站中 · 约 ' + dwellSec + ' 秒后发车' : (atTerminal ? '终到站停站中' : '停站中 · 约 ' + dwellSec + ' 秒后发车');
-      const speedTxt = (!pos.pre && !pos.dwelling && Number.isFinite(pos.speedKmh)) ? ' · 约 ' + Math.round(pos.speedKmh) + ' km/h' : '';
+      const speedTxt = (!pos.pre && !pos.dwelling && Number.isFinite(pos.speedKmh)) ? ' · 区间约 ' + Math.round(pos.speedKmh) + ' km/h' : '';
       const depShow = dep + (offsT[0] || 0);
       const title = svgEl('title');
       title.textContent = (dir.express ? '快车 · ' : '') + '往 ' + dir.to + ' · ' + fmtHM(depShow) + ' 发车' + (pos.dwelling ? ' · ' + dwellTxt : speedTxt);
@@ -1043,9 +1070,10 @@ function updateTrains(now) {
   const hud = $('#hud');
   const d0 = line.dirs[0];
   const expN = state.trains.filter((x) => x.express).length;
+  const maxKmh = LINE_MAX_KMH[line.name];
   hud.innerHTML = '<div class="hName">' + line.name + '</div>' +
     '<div class="hSub">' + line.stations.length + ' 站 · 全程 ' + Math.round(d0.total) + ' 分 · ' + state.trains.length + ' 列车运行中' +
-    (expN ? '（快车 ' + expN + '）' : '') + '</div>';
+    (expN ? '（快车 ' + expN + '）' : '') + (maxKmh ? ' · 最高 ' + maxKmh + ' km/h' : '') + '</div>';
   $('#footTrains').textContent = state.trains.length + ' 列（推演' + (expN ? '，快车 ' + expN : '') + '）';
 }
 
@@ -1089,6 +1117,41 @@ function renderPanel(force) {
 
   const now = nowSim();
   const nowMin = simMinutes(now);
+  const board = [];
+  for (const dir of line.dirs) {
+    for (const x of nextArrivalsAt(dir, state.station, nowMin, 3)) board.push(x);
+  }
+  board.sort((a, b) => a.at - b.at);
+  const boardEl = $('#stationBoard');
+  if (boardEl) {
+    const top = board.slice(0, 3);
+    if (!top.length) {
+      boardEl.innerHTML = '<div class="boardHead"><span>站台屏</span><span>接下来 3 班</span></div><div class="boardEmpty">暂无后续列车</div>';
+    } else if (top[0].at - nowMin > 60) {
+      boardEl.innerHTML = '<div class="boardHead"><span>站台屏</span><span>接下来 3 班</span></div><div class="boardEmpty">现在非运营时间<br>今日首班约 ' + fmtHM(top[0].at) + '</div>';
+    } else {
+      const cells = top.map((x) => {
+        const atOrigin = x.j === 0;
+        const ref = atOrigin ? x.dep : x.at;
+        const diff = Math.max(0, ref - nowMin);
+        const totalSec = Math.round(diff * 60);
+        const mm = Math.floor(totalSec / 60), ss = totalSec % 60;
+        const here = nowMin >= x.at - 0.05 && nowMin <= x.leave + 0.05;
+        const soon = diff < 0.7;
+        const time = here
+          ? '<div class="boardTime soon">' + (atOrigin ? '始发' : '已到站') + '</div>'
+          : soon
+          ? '<div class="boardTime soon">' + (atOrigin ? '即将始发' : '即将到站') + '</div>'
+          : '<div class="boardTime">' + mm + '<small>分</small>' + String(ss).padStart(2, '0') + '<small>秒</small></div>';
+        return '<div class="boardCell' + (x.d.express ? ' exp' : '') + '">' +
+          '<div class="boardDir">' + (x.d.express ? '<span class="expTag">快</span>' : '') + '往 ' + x.d.to + '</div>' +
+          time +
+          '<div class="boardAt">' + fmtHM(ref) + (atOrigin ? ' 发车' : ' 到站') + '</div>' +
+        '</div>';
+      }).join('');
+      boardEl.innerHTML = '<div class="boardHead"><span>站台屏</span><span>接下来 3 班</span></div><div class="boardGrid">' + cells + '</div>';
+    }
+  }
   const cards = [];
   for (const dir of line.dirs) {
     const exp = (dir.expDirs || [])[0] || null;
@@ -1122,7 +1185,7 @@ function renderPanel(force) {
           const at = dep + (offs[j] || 0) - dw;
           const leave = at + dw;
           if (leave >= nowMin - 0.05 && at >= anchor - 0.05) {
-            (d.express ? exps : locals).push({ dep, at, leave, d });
+            (d.express ? exps : locals).push({ dep, at, leave, d, j });
             if (++n >= 3) break;
           }
         }
@@ -1140,20 +1203,22 @@ function renderPanel(force) {
         }
       } else {
         arrivals.forEach((x, k) => {
-          const diff = Math.max(0, x.at - nowMin);
+          const atOrigin = x.j === 0;
+          const ref = atOrigin ? x.dep : x.at;
+          const diff = Math.max(0, ref - nowMin);
           const totalSec = Math.round(diff * 60);
           const mm = Math.floor(totalSec / 60), ss = totalSec % 60;
           const here = nowMin >= x.at - 0.05 && nowMin <= x.leave + 0.05;
           const soon = diff < 0.7;
           const pos = trainPos(line, x.d, nowMin - x.dep, x.dep);
-          const stops = (pos.dwelling && pos.B === st) ? 0 : stopsAhead(line, x.d, state.station, pos);
+          const stops = atOrigin ? 0 : ((pos.dwelling && pos.B === st) ? 0 : stopsAhead(line, x.d, state.station, pos));
           const stopTxt = stops > 0 ? '还有 ' + stops + ' 站 · ' : '';
-          const right = (k === 0 ? stopTxt : '') + fmtHM(x.at) + ' 到站';
+          const right = (k === 0 ? stopTxt : '') + fmtHM(ref) + (atOrigin ? ' 发车' : ' 到站');
           rows += '<div class="arrRow' + (k === 0 ? ' first' : '') + '">' +
             '<div class="arrLeft">' +
               (x.d.express ? '<span class="expTag">快</span>' : '') +
-              (here ? '<span class="count soon">已到站</span>' :
-                soon ? '<span class="count soon">即将到站</span>' :
+              (here ? '<span class="count soon">' + (atOrigin ? '始发' : '已到站') + '</span>' :
+                soon ? '<span class="count soon">' + (atOrigin ? '即将始发' : '即将到站') + '</span>' :
                 '<span class="count">' + mm + '</span><span class="unit">分</span>' +
                 '<span class="count sec">' + String(ss).padStart(2, '0') + '</span><span class="unit">秒</span>') +
             '</div>' +
